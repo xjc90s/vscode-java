@@ -1,6 +1,6 @@
 'use strict';
 
-import { ExtensionAPI, ClasspathQueryOptions, ClasspathResult, extensionApiVersion, ClientStatus } from "./extension.api";
+import { ExtensionAPI, ClasspathQueryOptions, ClasspathResult, extensionApiVersion, ClientStatus, SourceInvalidatedEvent } from "./extension.api";
 import { RequirementsData } from "./requirements";
 import { GetDocumentSymbolsCommand, getDocumentSymbolsProvider } from "./documentSymbols";
 import { GoToDefinitionCommand, goToDefinitionProvider } from "./goToDefinition";
@@ -9,6 +9,8 @@ import { Commands } from "./commands";
 import { Emitter } from "vscode-languageclient";
 import { ServerMode } from "./settings";
 import { registerHoverCommand } from "./hoverAction";
+import { onDidRequestEnd, onWillRequestStart } from "./TracingLanguageClient";
+import { getJavaConfiguration } from "./utils";
 
 class ApiManager {
 
@@ -16,9 +18,17 @@ class ApiManager {
     private onDidClasspathUpdateEmitter: Emitter<Uri> = new Emitter<Uri>();
     private onDidServerModeChangeEmitter: Emitter<ServerMode> = new Emitter<ServerMode>();
     private onDidProjectsImportEmitter: Emitter<Uri[]> = new Emitter<Uri[]>();
+    private onDidProjectsDeleteEmitter: Emitter<Uri[]> = new Emitter<Uri[]>();
+    private traceEventEmitter: Emitter<any> = new Emitter<any>();
+    private sourceInvalidatedEventEmitter: Emitter<SourceInvalidatedEvent> = new Emitter<SourceInvalidatedEvent>();
     private serverReadyPromiseResolve: (result: boolean) => void;
 
     public initialize(requirements: RequirementsData, serverMode: ServerMode): void {
+        // if it's manual import mode, set the server mode to lightweight, so that the
+        // project explorer won't spinning until import project is triggered.
+        if (getJavaConfiguration().get<string>("import.projectSelection") === "manual") {
+            serverMode = ServerMode.lightWeight;
+        }
         const getDocumentSymbols: GetDocumentSymbolsCommand = getDocumentSymbolsProvider();
         const goToDefinition: GoToDefinitionCommand = goToDefinitionProvider();
 
@@ -37,6 +47,8 @@ class ApiManager {
         const onDidClasspathUpdate = this.onDidClasspathUpdateEmitter.event;
         const onDidServerModeChange = this.onDidServerModeChangeEmitter.event;
         const onDidProjectsImport = this.onDidProjectsImportEmitter.event;
+        const onDidProjectsDelete = this.onDidProjectsDeleteEmitter.event;
+        const traceEvent = this.traceEventEmitter.event;
 
         const serverReadyPromise: Promise<boolean> = new Promise<boolean>((resolve) => {
             this.serverReadyPromiseResolve = resolve;
@@ -59,7 +71,12 @@ class ApiManager {
             serverMode,
             onDidServerModeChange,
             onDidProjectsImport,
+            onDidProjectsDelete,
             serverReady,
+            onWillRequestStart,
+            onDidRequestEnd,
+            trackEvent: traceEvent,
+            onDidSourceInvalidate: this.sourceInvalidatedEventEmitter.event,
         };
     }
 
@@ -81,6 +98,18 @@ class ApiManager {
 
     public fireDidProjectsImport(event: Uri[]): void {
         this.onDidProjectsImportEmitter.fire(event);
+    }
+
+    public fireDidProjectsDelete(event: Uri[]): void {
+        this.onDidProjectsDeleteEmitter.fire(event);
+    }
+
+    public fireTraceEvent(event: any): void {
+        this.traceEventEmitter.fire(event);
+    }
+
+    public fireSourceInvalidatedEvent(event: SourceInvalidatedEvent): void {
+        this.sourceInvalidatedEventEmitter.fire(event);
     }
 
     public updateServerMode(mode: ServerMode): void {
