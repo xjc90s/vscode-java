@@ -5,31 +5,40 @@ import * as fs from 'fs';
 import * as fse from 'fs-extra';
 import * as os from 'os';
 import * as path from 'path';
-import { CodeActionContext, CodeActionTriggerKind, commands, ConfigurationTarget, Diagnostic, env, EventEmitter, ExtensionContext, extensions, IndentAction, InputBoxOptions, languages, RelativePattern, TextDocument, UIKind, Uri, ViewColumn, window, workspace, WorkspaceConfiguration } from 'vscode';
-import { CancellationToken, CodeActionParams, CodeActionRequest, Command, DidChangeConfigurationNotification, ExecuteCommandParams, ExecuteCommandRequest, LanguageClientOptions, RevealOutputChannelOn } from 'vscode-languageclient';
+import * as semver from 'semver';
+import { CodeActionContext, commands, CompletionItem, ConfigurationTarget, Diagnostic, env, EventEmitter, ExtensionContext, extensions, IndentAction, InputBoxOptions, languages, Location, MarkdownString, QuickPickItemKind, Range, RelativePattern, SnippetString, SnippetTextEdit, TextDocument, TextEditorRevealType, UIKind, Uri, ViewColumn, window, workspace, WorkspaceConfiguration, WorkspaceEdit } from 'vscode';
+import { CancellationToken, CodeActionParams, CodeActionRequest, CodeActionResolveRequest, Command, CompletionRequest, DidChangeConfigurationNotification, ExecuteCommandParams, ExecuteCommandRequest, LanguageClientOptions, RevealOutputChannelOn } from 'vscode-languageclient';
 import { LanguageClient } from 'vscode-languageclient/node';
 import { apiManager } from './apiManager';
 import { ClientErrorHandler } from './clientErrorHandler';
-import { Commands } from './commands';
-import { ClientStatus, ExtensionAPI } from './extension.api';
+import { Commands, CommandTitle } from './commands';
+import { ClientStatus, ExtensionAPI, TraceEvent } from './extension.api';
 import * as fileEventHandler from './fileEventHandler';
-import { getSharedIndexCache, HEAP_DUMP_LOCATION, prepareExecutable } from './javaServerStarter';
+import { getSharedIndexCache, HEAP_DUMP_LOCATION, prepareExecutable, removeEquinoxFragmentOnDarwinX64, startedFromSources } from './javaServerStarter';
 import { initializeLogFile, logger } from './log';
 import { cleanupLombokCache } from "./lombokSupport";
 import { markdownPreviewProvider } from "./markdownPreviewProvider";
 import { OutputInfoCollector } from './outputInfoCollector';
-import { collectJavaExtensions, getBundlesToReload, isContributedPartUpdated } from './plugin';
-import { registerClientProviders } from './providerDispatcher';
-import { initialize as initializeRecommendation } from './recommendation';
+import { collectJavaExtensions, getBundlesToReload, getShortcuts, IJavaShortcut, isContributedPartUpdated } from './plugin';
+import { fixJdtSchemeHoverLinks, registerClientProviders } from './providerDispatcher';
 import * as requirements from './requirements';
-import { runtimeStatusBarProvider } from './runtimeStatusBarProvider';
-import { serverStatusBarProvider } from './serverStatusBarProvider';
-import { ACTIVE_BUILD_TOOL_STATE, cleanWorkspaceFileName, getJavaServerMode, handleTextBlockClosing, onConfigurationChange, ServerMode } from './settings';
+import { languageStatusBarProvider } from './runtimeStatusBarProvider';
+import { serverStatusBarProvider, ShortcutQuickPickItem } from './serverStatusBarProvider';
+import { ACTIVE_BUILD_TOOL_STATE, cleanWorkspaceFileName, getJavaServerMode, handleTextDocumentChanges, getImportMode, onConfigurationChange, ServerMode, ImportMode } from './settings';
 import { snippetCompletionProvider } from './snippetCompletionProvider';
+import { JavaClassEditorProvider } from './javaClassEditor';
 import { StandardLanguageClient } from './standardLanguageClient';
 import { SyntaxLanguageClient } from './syntaxLanguageClient';
-import { convertToGlob, deleteDirectory, ensureExists, getBuildFilePatterns, getExclusionBlob, getInclusionPatternsFromNegatedExclusion, getJavaConfig, getJavaConfiguration, hasBuildToolConflicts } from './utils';
+import { convertToGlob, deleteClientLog, deleteDirectory, ensureExists, getBuildFilePatterns, getExclusionGlob, getInclusionPatternsFromNegatedExclusion, getJavaConfig, getJavaConfiguration, hasBuildToolConflicts, resolveActualCause, getVersion } from './utils';
 import glob = require('glob');
+import { Telemetry } from './telemetry';
+import { getMessage } from './errorUtils';
+import { activationProgressNotification } from "./serverTaskPresenter";
+import { loadSupportedJreNames } from './jdkUtils';
+import { BuildFileSelector, PICKED_BUILD_FILES, cleanupWorkspaceState } from './buildFilesSelector';
+import { pasteFile } from './pasteAction';
+import { ServerStatusKind } from './serverStatus';
+import { TelemetryService } from '@redhat-developer/vscode-redhat-telemetry/lib/node';
 
 const syntaxClient: SyntaxLanguageClient = new SyntaxLanguageClient();
 const standardClient: StandardLanguageClient = new StandardLanguageClient();
@@ -58,8 +67,16 @@ async function showOOMMessage(): Promise<void> {
 	}
 }
 
+function getMaxMemFromConfiguration(includeUnit?: boolean): string | undefined {
+	const jvmArgs: string = getJavaConfiguration().get('jdt.ls.vmargs');
+	const results = includeUnit ? MAX_HEAP_SIZE_EXTRACTOR_WITH_UNIT.exec(jvmArgs)
+		: MAX_HEAP_SIZE_EXTRACTOR.exec(jvmArgs);
+	return results && results[0] ? results[1] : undefined;
+}
+
 const HEAP_DUMP_FOLDER_EXTRACTOR = new RegExp(`${HEAP_DUMP_LOCATION}(?:'([^']+)'|"([^"]+)"|([^\\s]+))`);
 const MAX_HEAP_SIZE_EXTRACTOR = new RegExp(`-Xmx([0-9]+)[kKmMgG]`);
+const MAX_HEAP_SIZE_EXTRACTOR_WITH_UNIT = new RegExp(`-Xmx([0-9]+[kKmMgG])`);
 
 /**
  * Returns the heap dump folder defined in the user's preferences, or undefined if the user does not set the heap dump folder
@@ -75,8 +92,36 @@ function getHeapDumpFolderFromSettings(): string {
 	return results[1] || results[2] || results[3];
 }
 
+const REPLACE_JDT_LINKS_PATTERN: RegExp = /(\[(?:[^\]])+\]\()(jdt:\/\/(?:(?:(?:\\\))|([^)]))+))\)/g;
 
-export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
+/**
+ * Replace `jdt://` links in the documentation with links that execute the VS Code command required to open the referenced file.
+ *
+ * Extracted from {@link fixJdtSchemeHoverLinks} for use in completion item documentation.
+ *
+ * @param oldDocumentation the documentation to fix the links in
+ * @returns the documentation with fixed links
+ */
+export function fixJdtLinksInDocumentation(oldDocumentation: MarkdownString): MarkdownString {
+	const newContent: string = oldDocumentation.value.replace(REPLACE_JDT_LINKS_PATTERN, (_substring, group1, group2) => {
+		const uri = `command:${Commands.OPEN_FILE}?${encodeURI(JSON.stringify([encodeURIComponent(group2)]))}`;
+		return `${group1}${uri})`;
+	});
+	const mdString = new MarkdownString(newContent);
+	mdString.isTrusted = true;
+	return mdString;
+}
+
+export async function activate(context: ExtensionContext): Promise<ExtensionAPI> {
+	await loadSupportedJreNames(context);
+	context.subscriptions.push(commands.registerCommand(Commands.FILESEXPLORER_ONPASTE, async () => {
+		const originalClipboard = await env.clipboard.readText();
+		// Hack in order to get path to selected folder if applicable (see https://github.com/microsoft/vscode/issues/3553#issuecomment-1098562676)
+		await commands.executeCommand('copyFilePath');
+		const folder = await env.clipboard.readText();
+		await env.clipboard.writeText(originalClipboard);
+		pasteFile(folder);
+	}));
 	context.subscriptions.push(markdownPreviewProvider);
 	context.subscriptions.push(commands.registerCommand(Commands.TEMPLATE_VARIABLES, async () => {
 		markdownPreviewProvider.show(context.asAbsolutePath(path.join('document', `${Commands.TEMPLATE_VARIABLES}.md`)), 'Predefined Variables', "", context);
@@ -86,7 +131,7 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 	}));
 
 	storagePath = context.storagePath;
-	context.subscriptions.push(commands.registerCommand(Commands.MEATDATA_FILES_GENERATION, async () => {
+	context.subscriptions.push(commands.registerCommand(Commands.METADATA_FILES_GENERATION, async () => {
 		markdownPreviewProvider.show(context.asAbsolutePath(path.join('document', `_java.metadataFilesGeneration.md`)), 'Metadata Files Generation', "", context);
 	}));
 	context.subscriptions.push(commands.registerCommand(Commands.LEARN_MORE_ABOUT_CLEAN_UPS, async () => {
@@ -95,18 +140,36 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 	if (!storagePath) {
 		storagePath = getTempWorkspace();
 	}
+	const workspacePath = path.resolve(`${storagePath}/jdt_ws`);
 	clientLogFile = path.join(storagePath, 'client.log');
+	const cleanWorkspaceExists = fs.existsSync(path.join(workspacePath, cleanWorkspaceFileName));
+	if (cleanWorkspaceExists) {
+		deleteClientLog(storagePath);
+	}
 	initializeLogFile(clientLogFile);
 
-	enableJavadocSymbols();
+	Telemetry.startTelemetry(context);
 
-	initializeRecommendation(context);
+	enableJavadocSymbols();
 
 	registerOutOfMemoryDetection(storagePath);
 
 	cleanJavaWorkspaceStorage();
 
-	serverStatusBarProvider.initialize();
+	if (!startedFromSources()) { // Dev mode: version may not match package.json, deleting the in-use folder
+		cleanOldGlobalStorage(context);
+	}
+
+	// https://github.com/redhat-developer/vscode-java/issues/3484
+	if (process.platform === 'darwin' && process.arch === 'x64') {
+		try {
+			if (semver.lt(os.release(), '20.0.0')) {
+				removeEquinoxFragmentOnDarwinX64(context);
+			}
+		} catch (error) {
+			// do nothing
+		}
+	}
 
 	return requirements.resolveRequirements(context).catch(error => {
 		// show error
@@ -120,7 +183,6 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 	}).then(async (requirements) => {
 		const triggerFiles = await getTriggerFiles();
 		return new Promise<ExtensionAPI>(async (resolve) => {
-			const workspacePath = path.resolve(`${storagePath}/jdt_ws`);
 			const syntaxServerWorkspacePath = path.resolve(`${storagePath}/ss_ws`);
 
 			let serverMode = getJavaServerMode();
@@ -132,6 +194,7 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 			const isDebugModeByClientPort = !!process.env['SYNTAXLS_CLIENT_PORT'] || !!process.env['JDTLS_CLIENT_PORT'];
 			const requireSyntaxServer = (serverMode !== ServerMode.standard) && (!isDebugModeByClientPort || !!process.env['SYNTAXLS_CLIENT_PORT']);
 			let requireStandardServer = (serverMode !== ServerMode.lightWeight) && (!isDebugModeByClientPort || !!process.env['JDTLS_CLIENT_PORT']);
+			let initFailureReported: boolean = false;
 
 			// Options to control the language client
 			const clientOptions: LanguageClientOptions = {
@@ -142,14 +205,13 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 					{ scheme: 'untitled', language: 'java' }
 				],
 				synchronize: {
-					configurationSection: ['java', 'editor.insertSpaces', 'editor.tabSize'],
+					configurationSection: ['java', 'editor.insertSpaces', 'editor.tabSize', "files.associations"],
 				},
 				initializationOptions: {
 					bundles: collectJavaExtensions(extensions.all),
 					workspaceFolders: workspace.workspaceFolders ? workspace.workspaceFolders.map(f => f.uri.toString()) : null,
-					settings: { java: getJavaConfig(requirements.java_home) },
+					settings: { java: await getJavaConfig(requirements.java_home) },
 					extendedClientCapabilities: {
-						progressReportProvider: getJavaConfiguration().get('progressReports.enabled'),
 						classFileContentsSupport: true,
 						overrideMethodsPromptSupport: true,
 						hashCodeEqualsPromptSupport: true,
@@ -164,35 +226,43 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 						clientHoverProvider: true,
 						clientDocumentSymbolProvider: true,
 						gradleChecksumWrapperPromptSupport: true,
-						resolveAdditionalTextEditsSupport: true,
 						advancedIntroduceParameterRefactoringSupport: true,
 						actionableRuntimeNotificationSupport: true,
-						shouldLanguageServerExitOnShutdown: true,
 						onCompletionItemSelectedCommand: "editor.action.triggerParameterHints",
 						extractInterfaceSupport: true,
+						advancedUpgradeGradleSupport: true,
+						executeClientCommandSupport: true,
+						snippetEditSupport: true,
 					},
 					triggerFiles,
 				},
 				middleware: {
 					workspace: {
-						didChangeConfiguration: () => {
-							standardClient.getClient().sendNotification(DidChangeConfigurationNotification.type, {
+						didChangeConfiguration: async () => {
+							await standardClient.getClient().sendNotification(DidChangeConfigurationNotification.type, {
 								settings: {
-									java: getJavaConfig(requirements.java_home),
+									java: await getJavaConfig(requirements.java_home),
 								}
 							});
 						}
 					},
+					resolveCompletionItem: async (item, token, next): Promise<CompletionItem> => {
+						const completionItem = await next(item, token);
+						if (completionItem.documentation instanceof MarkdownString) {
+							completionItem.documentation = fixJdtLinksInDocumentation(completionItem.documentation);
+						}
+						return completionItem;
+					},
 					// https://github.com/redhat-developer/vscode-java/issues/2130
 					// include all diagnostics for the current line in the CodeActionContext params for the performance reason
-					provideCodeActions: (document, range, context, token, next) => {
+					provideCodeActions: async (document, range, context, token, next) => {
 						const client: LanguageClient = standardClient.getClient();
 						const params: CodeActionParams = {
 							textDocument: client.code2ProtocolConverter.asTextDocumentIdentifier(document),
 							range: client.code2ProtocolConverter.asRange(range),
-							context: client.code2ProtocolConverter.asCodeActionContext(context)
+							context: await client.code2ProtocolConverter.asCodeActionContext(context)
 						};
-						const showAt  = getJavaConfiguration().get<string>("quickfix.showAt");
+						const showAt = getJavaConfiguration().get<string>("quickfix.showAt");
 						if (showAt === 'line' && range.start.line === range.end.line && range.start.character === range.end.character) {
 							const textLine = document.lineAt(params.range.start.line);
 							if (textLine !== null) {
@@ -209,12 +279,12 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 								const codeActionContext: CodeActionContext = {
 									diagnostics: allDiagnostics,
 									only: context.only,
-									triggerKind: CodeActionTriggerKind.Invoke,
+									triggerKind: context.triggerKind,
 								};
-								params.context = client.code2ProtocolConverter.asCodeActionContext(codeActionContext);
+								params.context = await client.code2ProtocolConverter.asCodeActionContext(codeActionContext);
 							}
 						}
-						return client.sendRequest(CodeActionRequest.type, params, token).then((values) => {
+						return client.sendRequest(CodeActionRequest.type, params, token).then(async (values) => {
 							if (values === null) {
 								return undefined;
 							}
@@ -224,38 +294,111 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 									result.push(client.protocol2CodeConverter.asCommand(item));
 								}
 								else {
-									result.push(client.protocol2CodeConverter.asCodeAction(item));
+									result.push(await client.protocol2CodeConverter.asCodeAction(item));
 								}
 							}
 							return result;
 						}, (error) => {
 							return client.handleFailedRequest(CodeActionRequest.type, token, error, []);
 						});
+					},
+
+					resolveCodeAction: async (item, token, next) => {
+						const client: LanguageClient = standardClient.getClient();
+						const documentUris = [];
+						const snippetEdits = [];
+						return client.sendRequest(CodeActionResolveRequest.type, client.code2ProtocolConverter.asCodeActionSync(item), token).then(async (result) => {
+							if (token.isCancellationRequested) {
+								return item;
+							}
+							const docChanges = result.edit !== undefined ? result.edit.documentChanges : undefined;
+							if (docChanges !== undefined) {
+								for (const docChange of docChanges) {
+									if ("textDocument" in docChange) {
+										for (const edit of docChange.edits) {
+											if ("snippet" in edit) {
+												documentUris.push(Uri.parse(docChange.textDocument.uri).toString());
+												snippetEdits.push(new SnippetTextEdit(client.protocol2CodeConverter.asRange((edit as any).range), new SnippetString((edit as any).snippet.value)));
+											}
+										}
+									}
+								}
+								const codeAction = await client.protocol2CodeConverter.asCodeAction(result, token);
+								const docEdits = codeAction.edit !== undefined? codeAction.edit.entries() : [];
+								for (const docEdit of docEdits) {
+									const uri = docEdit[0];
+									if (documentUris.includes(uri.toString())) {
+										const editList = [];
+										for (const edit of docEdit[1]) {
+											let isSnippet = false;
+											snippetEdits.forEach((snippet, index) => {
+												if (edit.range.isEqual(snippet.range) && documentUris[index] === uri.toString()) {
+													editList.push(snippet);
+													isSnippet = true;
+												}
+											});
+											if (!isSnippet) {
+												editList.push(edit);
+											}
+										}
+										codeAction.edit.set(uri, null);
+										codeAction.edit.set(uri, editList);
+									}
+								}
+								return codeAction;
+							}
+							return await client.protocol2CodeConverter.asCodeAction(result, token);
+						}, (error) => {
+							return client.handleFailedRequest(CodeActionResolveRequest.type, token, error, item);
+						});
+					},
+
+					provideReferences: async(document, position, options, token, next): Promise<Location[]> => {
+						// Override includeDeclaration from VS Code by allowing it to be configured
+						options.includeDeclaration = getJavaConfiguration().get('references.includeDeclarations');
+						return await next(document, position, options, token);
 					}
 				},
 				revealOutputChannelOn: RevealOutputChannelOn.Never,
 				errorHandler: new ClientErrorHandler(extensionName),
 				initializationFailedHandler: error => {
 					logger.error(`Failed to initialize ${extensionName} due to ${error && error.toString()}`);
-					return true;
+					if ((error.toString().includes('Connection')  && error.toString().includes('disposed')) || error.toString().includes('Internal error')) {
+						if (!initFailureReported) {
+							apiManager.fireTraceEvent({
+								name: "java.client.error.initialization",
+								properties: {
+									message: error && error.toString(),
+									data: resolveActualCause(error?.data),
+								},
+							});
+						}
+						initFailureReported = true;
+						return false;
+					} else {
+						return true;
+					}
 				},
 				outputChannel: requireStandardServer ? new OutputInfoCollector(extensionName) : undefined,
 				outputChannelName: extensionName
 			};
 
 			apiManager.initialize(requirements, serverMode);
+			registerCodeCompletionTelemetryListener();
 			resolve(apiManager.getApiInstance());
 			// the promise is resolved
 			// no need to pass `resolve` into any code past this point,
 			// since `resolve` is a no-op from now on
-
+			const serverOptions = prepareExecutable(requirements, syntaxServerWorkspacePath, context, true);
 			if (requireSyntaxServer) {
 				if (process.env['SYNTAXLS_CLIENT_PORT']) {
 					syntaxClient.initialize(requirements, clientOptions);
 				} else {
-					syntaxClient.initialize(requirements, clientOptions, prepareExecutable(requirements, syntaxServerWorkspacePath, getJavaConfig(requirements.java_home), context, true));
+					syntaxClient.initialize(requirements, clientOptions, serverOptions);
 				}
-				syntaxClient.start();
+				syntaxClient.start().then(() => {
+					syntaxClient.registerSyntaxClientActions(serverOptions);
+				});
 				serverStatusBarProvider.showLightWeightStatus();
 			}
 
@@ -282,21 +425,56 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 				}
 			}));
 
-			const cleanWorkspaceExists = fs.existsSync(path.join(workspacePath, cleanWorkspaceFileName));
 			if (cleanWorkspaceExists) {
+				const data = {};
 				try {
 					cleanupLombokCache(context);
+					cleanupWorkspaceState(context);
 					deleteDirectory(workspacePath);
 					deleteDirectory(syntaxServerWorkspacePath);
 				} catch (error) {
+					data['error'] = getMessage(error);
 					window.showErrorMessage(`Failed to delete ${workspacePath}: ${error}`);
 				}
+				await Telemetry.sendTelemetry(Commands.CLEAN_WORKSPACE, data);
 			}
 
 			// Register commands here to make it available even when the language client fails
-			context.subscriptions.push(commands.registerCommand(Commands.OPEN_SERVER_LOG, (column: ViewColumn) => openServerLogFile(workspacePath, column)));
-			context.subscriptions.push(commands.registerCommand(Commands.OPEN_SERVER_STDOUT_LOG, (column: ViewColumn) => openRollingServerLogFile(workspacePath, '.out-jdt.ls', column)));
-			context.subscriptions.push(commands.registerCommand(Commands.OPEN_SERVER_STDERR_LOG, (column: ViewColumn) => openRollingServerLogFile(workspacePath, '.error-jdt.ls', column)));
+			context.subscriptions.push(commands.registerCommand(Commands.OPEN_STATUS_SHORTCUT, async (status: string) => {
+				const items: ShortcutQuickPickItem[] = [];
+				if (status === ServerStatusKind.error || status === ServerStatusKind.warning) {
+					commands.executeCommand("workbench.panel.markers.view.focus");
+				} else {
+					commands.executeCommand(Commands.SHOW_SERVER_TASK_STATUS, true);
+				}
+
+				items.push(...getShortcuts().map((shortcut: IJavaShortcut) => {
+					return {
+						label: shortcut.title,
+						command: shortcut.command,
+						args: shortcut.arguments,
+					};
+				}));
+
+				const choice = await window.showQuickPick(items);
+				if (!choice) {
+					return;
+				}
+
+				apiManager.fireTraceEvent({
+					name: "triggerShortcutCommand",
+					properties: {
+						message: choice.command,
+					},
+				});
+
+				if (choice.command) {
+					commands.executeCommand(choice.command, ...(choice.args || []));
+				}
+			}));
+			context.subscriptions.push(commands.registerCommand(Commands.OPEN_SERVER_LOG, (column: ViewColumn) => openServerLogFile(storagePath, column)));
+			context.subscriptions.push(commands.registerCommand(Commands.OPEN_SERVER_STDOUT_LOG, (column: ViewColumn) => openRollingServerLogFile(storagePath, '.out-jdt.ls', column)));
+			context.subscriptions.push(commands.registerCommand(Commands.OPEN_SERVER_STDERR_LOG, (column: ViewColumn) => openRollingServerLogFile(storagePath, '.error-jdt.ls', column)));
 
 			context.subscriptions.push(commands.registerCommand(Commands.OPEN_CLIENT_LOG, (column: ViewColumn) => openClientLogFile(clientLogFile, column)));
 
@@ -305,7 +483,16 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 			context.subscriptions.push(commands.registerCommand(Commands.OPEN_FORMATTER, async () => openFormatter(context.extensionPath)));
 			context.subscriptions.push(commands.registerCommand(Commands.OPEN_FILE, async (uri: string) => {
 				const parsedUri = Uri.parse(uri);
-				await window.showTextDocument(parsedUri);
+				const editor = await window.showTextDocument(parsedUri);
+				// Reveal the document at the specified line, if possible (e.g. jumping to a specific javadoc method).
+				if (editor && parsedUri.scheme === 'jdt' && parsedUri.fragment) {
+					const line = parseInt(parsedUri.fragment);
+					if (isNaN(line) || line < 1 || line > editor.document.lineCount) {
+						return;
+					}
+					const range = editor.document.lineAt(line -1).range;
+					editor.revealRange(range, TextEditorRevealType.AtTop);
+				}
 			}));
 
 			context.subscriptions.push(commands.registerCommand(Commands.CLEAN_WORKSPACE, (force?: boolean) => cleanWorkspace(workspacePath, force)));
@@ -318,6 +505,8 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 			}));
 
 			context.subscriptions.push(onConfigurationChange(workspacePath, context));
+
+			registerRestartJavaLanguageServerCommand(context);
 
 			/**
 			 * Command to switch the server mode. Currently it only supports switch from lightweight to standard.
@@ -340,7 +529,7 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 				}
 
 				const api: ExtensionAPI = apiManager.getApiInstance();
-				if (api.serverMode === switchTo || api.serverMode === ServerMode.standard) {
+				if (!force && (api.serverMode === switchTo || api.serverMode === ServerMode.standard)) {
 					return;
 				}
 
@@ -352,13 +541,26 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 				}
 
 				if (choice === "Yes") {
-					await startStandardServer(context, requirements, clientOptions, workspacePath);
+					await startStandardServer(context, requirements, clientOptions, workspacePath, true /* triggeredByCommand */);
 				}
 			});
 
+			context.subscriptions.push(commands.registerCommand(Commands.CHANGE_JAVA_SEARCH_SCOPE, async () => {
+				const selection = await window.showQuickPick(["all", "main"], {
+					canPickMany: false,
+					placeHolder: `Current: ${workspace.getConfiguration().get("java.search.scope")}`,
+				});
+				if(selection) {
+					workspace.getConfiguration().update("java.search.scope", selection, false);
+				}
+			}));
+
 			context.subscriptions.push(snippetCompletionProvider.initialize());
 			context.subscriptions.push(serverStatusBarProvider);
-			context.subscriptions.push(runtimeStatusBarProvider);
+			context.subscriptions.push(languageStatusBarProvider);
+
+			const classEditorProviderRegistration = window.registerCustomEditorProvider(JavaClassEditorProvider.viewType, new JavaClassEditorProvider(context));
+			context.subscriptions.push(classEditorProviderRegistration);
 
 			registerClientProviders(context, { contentProviderEvent: jdtEventEmitter.event });
 
@@ -366,7 +568,7 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 				if (event === ServerMode.standard) {
 					syntaxClient.stop();
 					fileEventHandler.setServerStatus(true);
-					runtimeStatusBarProvider.initialize(context);
+					languageStatusBarProvider.initialize(context);
 				}
 				commands.executeCommand('setContext', 'java:serverMode', event);
 			});
@@ -377,8 +579,12 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 				const importOnStartup = config.get(importOnStartupSection);
 				if (importOnStartup === "disabled" ||
 					env.uiKind === UIKind.Web && env.appName.includes("Visual Studio Code")) {
+					apiManager.getApiInstance().serverMode = ServerMode.lightWeight;
+					apiManager.fireDidServerModeChange(ServerMode.lightWeight);
 					requireStandardServer = false;
 				} else if (importOnStartup === "interactive" && await workspaceContainsBuildFiles()) {
+					apiManager.getApiInstance().serverMode = ServerMode.lightWeight;
+					apiManager.fireDidServerModeChange(ServerMode.lightWeight);
 					requireStandardServer = await promptUserForStandardServer(config);
 				} else {
 					requireStandardServer = true;
@@ -409,19 +615,38 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 					}
 				}));
 			}
-			context.subscriptions.push(workspace.onDidChangeTextDocument(event => handleTextBlockClosing(event.document, event.contentChanges)));
+			context.subscriptions.push(workspace.onDidChangeTextDocument(event => handleTextDocumentChanges(event.document, event.contentChanges)));
 		});
 	});
 }
 
-async function startStandardServer(context: ExtensionContext, requirements: requirements.RequirementsData, clientOptions: LanguageClientOptions, workspacePath: string) {
+async function startStandardServer(context: ExtensionContext, requirements: requirements.RequirementsData, clientOptions: LanguageClientOptions, workspacePath: string, triggeredByCommand: boolean = false) {
 	if (standardClient.getClientStatus() !== ClientStatus.uninitialized) {
 		return;
 	}
 
-	const checkConflicts: boolean = await ensureNoBuildToolConflicts(context, clientOptions);
-	if (!checkConflicts) {
-		return;
+	const selector: BuildFileSelector = new BuildFileSelector(context, []);
+	const importMode: ImportMode = await getImportMode(context, selector);
+	if (importMode === ImportMode.automatic) {
+		if (!await ensureNoBuildToolConflicts(context, clientOptions)) {
+			return;
+		}
+	} else {
+		const buildFiles: string[] = [];
+		if (importMode === ImportMode.manual) {
+			const cache = context.workspaceState.get<string[]>(PICKED_BUILD_FILES);
+			if (cache === undefined || cache.length === 0 && triggeredByCommand) {
+				buildFiles.push(...await selector.selectBuildFiles() || []);
+			} else {
+				buildFiles.push(...cache);
+			}
+		}
+		if (buildFiles.length === 0) {
+			commands.executeCommand('setContext', 'java:serverMode', ServerMode.lightWeight);
+			serverStatusBarProvider.showNotImportedStatus();
+			return;
+		}
+		clientOptions.initializationOptions.projectConfigurations = buildFiles;
 	}
 
 	if (apiManager.getApiInstance().serverMode === ServerMode.lightWeight) {
@@ -430,8 +655,10 @@ async function startStandardServer(context: ExtensionContext, requirements: requ
 		apiManager.fireDidServerModeChange(ServerMode.hybrid);
 	}
 	await standardClient.initialize(context, requirements, clientOptions, workspacePath, jdtEventEmitter);
-	standardClient.start();
-	serverStatusBarProvider.showStandardStatus();
+	standardClient.start().then(async () => {
+		standardClient.registerLanguageClientActions(context, await fse.pathExists(path.join(workspacePath, ".metadata", ".plugins")), jdtEventEmitter);
+	});
+	serverStatusBarProvider.setBusy("Activating...");
 }
 
 async function workspaceContainsBuildFiles(): Promise<boolean> {
@@ -440,14 +667,14 @@ async function workspaceContainsBuildFiles(): Promise<boolean> {
 	const inclusionPatterns: string[] = getBuildFilePatterns();
 	const inclusionPatternsFromNegatedExclusion: string[] = getInclusionPatternsFromNegatedExclusion();
 	if (inclusionPatterns.length > 0 && inclusionPatternsFromNegatedExclusion.length > 0 &&
-			(await workspace.findFiles(convertToGlob(inclusionPatterns, inclusionPatternsFromNegatedExclusion), null, 1 /* maxResults */)).length > 0) {
+		(await workspace.findFiles(convertToGlob(inclusionPatterns, inclusionPatternsFromNegatedExclusion), null, 1 /* maxResults */)).length > 0) {
 		return true;
 	}
 
 	// Nothing found in negated exclusion pattern, do a normal search then.
-	const inclusionBlob: string = convertToGlob(inclusionPatterns);
-	const exclusionBlob: string = getExclusionBlob();
-	if (inclusionBlob && (await workspace.findFiles(inclusionBlob, exclusionBlob, 1 /* maxResults */)).length > 0) {
+	const inclusionGlob: string = convertToGlob(inclusionPatterns);
+	const exclusionGlob: string = getExclusionGlob();
+	if (inclusionGlob && (await workspace.findFiles(inclusionGlob, exclusionGlob, 1 /* maxResults */)).length > 0) {
 		return true;
 	}
 
@@ -477,7 +704,7 @@ async function ensureNoBuildToolConflicts(context: ExtensionContext, clientOptio
 			clientOptions.initializationOptions.settings.java.import.maven.enabled = false;
 			context.workspaceState.update(ACTIVE_BUILD_TOOL_STATE, "gradle");
 		} else {
-			throw new Error (`Unknown build tool: ${activeBuildTool}`); // unreachable
+			throw new Error(`Unknown build tool: ${activeBuildTool}`); // unreachable
 		}
 	}
 
@@ -532,7 +759,9 @@ export async function getActiveLanguageClient(): Promise<LanguageClient | undefi
 		return undefined;
 	}
 
-	await languageClient.onReady();
+	if (languageClient.needsStart()) {
+		await languageClient.start();
+	}
 
 	return languageClient;
 }
@@ -574,12 +803,17 @@ function enableJavadocSymbols() {
 				// e.g.  *-----*/|
 				beforeText: /^(\t|(\ \ ))*\ \*[^/]*\*\/\s*$/,
 				action: { indentAction: IndentAction.None, removeText: 1 }
+			},
+			{
+				// e.g. /// ...| (Markdown javadoc)
+				beforeText: /^\s*\/\/\/(.*)?$/,
+				action: { indentAction: IndentAction.None, appendText: '/// ' }
 			}
 		]
 	});
 }
 
-function getTempWorkspace() {
+export function getTempWorkspace() {
 	return path.resolve(os.tmpdir(), `vscodesws_${makeRandomHexString(5)}`);
 }
 
@@ -620,13 +854,19 @@ async function cleanSharedIndexes(context: ExtensionContext) {
 	}
 }
 
-function openServerLogFile(workspacePath, column: ViewColumn = ViewColumn.Active): Thenable<boolean> {
+function openServerLogFile(storagePath, column: ViewColumn = ViewColumn.Active): Thenable<boolean> {
+	const workspacePath = getWorkspacePath(storagePath);
 	const serverLogFile = path.join(workspacePath, '.metadata', '.log');
 	return openLogFile(serverLogFile, 'Could not open Java Language Server log file', column);
 }
 
-function openRollingServerLogFile(workspacePath, filename, column: ViewColumn = ViewColumn.Active): Thenable<boolean> {
+function getWorkspacePath(storagePath: any) {
+	return path.join(storagePath, apiManager.getApiInstance().serverMode === ServerMode.lightWeight ? 'ss_ws' : 'jdt_ws');
+}
+
+function openRollingServerLogFile(storagePath, filename, column: ViewColumn = ViewColumn.Active): Thenable<boolean> {
 	return new Promise((resolve) => {
+		const workspacePath = getWorkspacePath(storagePath);
 		const dirname = path.join(workspacePath, '.metadata');
 
 		// find out the newest one
@@ -677,6 +917,8 @@ async function openLogs() {
 	await commands.executeCommand(Commands.OPEN_SERVER_LOG, ViewColumn.One);
 	await commands.executeCommand(Commands.OPEN_SERVER_STDOUT_LOG, ViewColumn.One);
 	await commands.executeCommand(Commands.OPEN_SERVER_STDERR_LOG, ViewColumn.One);
+	const client = await getActiveLanguageClient();
+	client?.outputChannel.show(true);
 }
 
 function openLogFile(logFile, openingFailureWarning: string, column: ViewColumn = ViewColumn.Active): Thenable<boolean> {
@@ -689,7 +931,7 @@ function openLogFile(logFile, openingFailureWarning: string, column: ViewColumn 
 			if (!doc) {
 				return false;
 			}
-			return window.showTextDocument(doc, {viewColumn: column, preview: false})
+			return window.showTextDocument(doc, { viewColumn: column, preview: false })
 				.then(editor => !!editor);
 		}, () => false)
 		.then(didOpen => {
@@ -863,7 +1105,9 @@ async function getTriggerFiles(): Promise<string[]> {
 			}
 		}
 
-		const javaFilesUnderRoot: Uri[] = await workspace.findFiles(new RelativePattern(rootFolder, "*.java"), undefined, 1);
+		// Paths set by 'java.import.exclusions' will be ignored when searching trigger files.
+		const exclusionGlob = getExclusionGlob();
+		const javaFilesUnderRoot: Uri[] = await workspace.findFiles(new RelativePattern(rootFolder, "*.java"), exclusionGlob, 1);
 		for (const javaFile of javaFilesUnderRoot) {
 			if (isPrefix(rootPath, javaFile.fsPath)) {
 				openedJavaFiles.push(javaFile.toString());
@@ -871,7 +1115,7 @@ async function getTriggerFiles(): Promise<string[]> {
 			}
 		}
 
-		const javaFilesInCommonPlaces: Uri[] = await workspace.findFiles(new RelativePattern(rootFolder, "{src, test}/**/*.java"), undefined, 1);
+		const javaFilesInCommonPlaces: Uri[] = await workspace.findFiles(new RelativePattern(rootFolder, "{src, test}/**/*.java"), exclusionGlob, 1);
 		for (const javaFile of javaFilesInCommonPlaces) {
 			if (isPrefix(rootPath, javaFile.fsPath)) {
 				openedJavaFiles.push(javaFile.toString());
@@ -886,7 +1130,7 @@ async function getTriggerFiles(): Promise<string[]> {
 function getJavaFilePathOfTextDocument(document: TextDocument): string | undefined {
 	if (document) {
 		const resource = document.uri;
-		if (resource.scheme === 'file' && resource.fsPath.endsWith('.java')) {
+		if (resource.scheme === 'file' && document.languageId === "java") {
 			return path.normalize(resource.fsPath);
 		}
 	}
@@ -927,7 +1171,46 @@ async function cleanJavaWorkspaceStorage() {
 				}
 			}
 		});
-    }
+	}
+}
+
+async function cleanOldGlobalStorage(context: ExtensionContext) {
+	const currentVersion = getVersion(context.extensionPath);
+	const globalStoragePath = context.globalStorageUri?.fsPath; // .../Code/User/globalStorage/redhat.java
+
+	ensureExists(globalStoragePath);
+
+	// delete folders in .../User/globalStorage/redhat.java that are not named the current version
+	fs.promises.readdir(globalStoragePath).then(async (files) => {
+		await Promise.all(files.map(async (file) => {
+			const currentPath = path.join(globalStoragePath, file);
+			const stat = await fs.promises.stat(currentPath);
+
+			if (stat.isDirectory() && file !== currentVersion) {
+				logger.info(`Removing old folder in globalStorage : ${file}`);
+				deleteDirectory(currentPath);
+			}
+		}));
+	});
+}
+
+export function registerCodeCompletionTelemetryListener() {
+	apiManager.getApiInstance().onDidRequestEnd((traceEvent: TraceEvent) => {
+		if (traceEvent.type === CompletionRequest.method) {
+			// Exclude the invalid completion requests.
+			if (!traceEvent.resultLength) {
+				return;
+			}
+			const props = {
+				duration: Math.round(traceEvent.duration * 100) / 100,
+				resultLength: traceEvent.resultLength || 0,
+				error: !!traceEvent.error,
+				fromSyntaxServer: !!traceEvent.fromSyntaxServer,
+				engine: getJavaConfiguration().get('completion.engine'),
+			};
+			return Telemetry.sendTelemetry(Telemetry.COMPLETION_EVENT, props);
+		}
+	});
 }
 
 function registerOutOfMemoryDetection(storagePath: string) {
@@ -941,6 +1224,38 @@ function registerOutOfMemoryDetection(storagePath: string) {
 		if (heapDumpFolder === storagePath) {
 			fse.remove(path);
 		}
+		apiManager.fireTraceEvent({
+			name: "java.process.outofmemory",
+			properties: {
+				maxMem: getMaxMemFromConfiguration(true),
+			}
+		});
+		Telemetry.sendTelemetry("java.process.outofmemory", {
+			maxMem: getMaxMemFromConfiguration(true),
+		});
 		showOOMMessage();
+		serverStatusBarProvider.setError();
+		activationProgressNotification.hide();
 	});
+}
+
+function registerRestartJavaLanguageServerCommand(context: ExtensionContext) {
+	context.subscriptions.push(commands.registerCommand(Commands.RESTART_LANGUAGE_SERVER, async () => {
+		switch (getJavaServerMode()) {
+			case (ServerMode.standard):
+				// Standard server restart
+				await standardClient.getClient().restart();
+				break;
+			case (ServerMode.lightWeight):
+				// Syntax server restart
+				await syntaxClient.getClient().restart();
+				break;
+			case (ServerMode.hybrid):
+				if (syntaxClient.isAlive()) {
+					await syntaxClient.getClient().restart();
+				}
+				await standardClient.getClient().restart();
+				break;
+		}
+	}));
 }

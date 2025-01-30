@@ -6,7 +6,8 @@ import { commands, ExtensionContext, Position, QuickPickItem, TextDocument, Uri,
 import { FormattingOptions, WorkspaceEdit, RenameFile, DeleteFile, TextDocumentEdit, CodeActionParams, SymbolInformation } from 'vscode-languageclient';
 import { LanguageClient } from 'vscode-languageclient/node';
 import { Commands as javaCommands } from './commands';
-import { GetRefactorEditRequest, MoveRequest, RefactorWorkspaceEdit, RenamePosition, GetMoveDestinationsRequest, SearchSymbols, SelectionInfo, InferSelectionRequest } from './protocol';
+import { GetRefactorEditRequest, MoveRequest, RefactorWorkspaceEdit, RenamePosition, GetMoveDestinationsRequest, SearchSymbols, SelectionInfo, InferSelectionRequest, GetChangeSignatureInfoRequest, ChangeSignatureInfo } from './protocol';
+import { ChangeSignaturePanel } from './refactoring/changeSignaturePanel';
 import { getExtractInterfaceArguments, revealExtractedInterface } from './refactoring/extractInterface';
 
 export function registerCommands(languageClient: LanguageClient, context: ExtensionContext) {
@@ -40,6 +41,7 @@ function registerApplyRefactorCommand(languageClient: LanguageClient, context: E
             || command === 'extractMethod'
             || command === 'extractField'
             || command === 'extractInterface'
+            || command === 'changeSignature'
             || command === 'assignField'
             || command === 'convertVariableToField'
             || command === 'invertVariable'
@@ -109,6 +111,14 @@ function registerApplyRefactorCommand(languageClient: LanguageClient, context: E
                     return;
                 }
                 commandArguments.push(...args);
+            } else if (command === 'changeSignature') {
+                const changeSignatureInfo: ChangeSignatureInfo = await languageClient.sendRequest(GetChangeSignatureInfoRequest.type, params);
+                if (changeSignatureInfo.errorMessage !== undefined) {
+                    window.showWarningMessage(changeSignatureInfo.errorMessage);
+                    return;
+                }
+                ChangeSignaturePanel.render(context.extensionUri, languageClient, command, params, formattingOptions, changeSignatureInfo);
+                return;
             }
 
             const result: RefactorWorkspaceEdit = await languageClient.sendRequest(GetRefactorEditRequest.type, {
@@ -226,7 +236,7 @@ async function applyRefactorEdit(languageClient: LanguageClient, refactorEdit: R
     }
 
     if (refactorEdit.edit) {
-        const edit = languageClient.protocol2CodeConverter.asWorkspaceEdit(refactorEdit.edit);
+        const edit = await languageClient.protocol2CodeConverter.asWorkspaceEdit(refactorEdit.edit);
         if (edit) {
             await workspace.applyEdit(edit);
         }
