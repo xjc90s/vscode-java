@@ -57,7 +57,7 @@ async function handleNewJavaFiles(e: FileCreateEvent) {
     }
 
     // See https://github.com/redhat-developer/vscode-java/issues/2939
-    // The client side listener should avoid inserting duplicated conents
+    // The client side listener should avoid inserting duplicated contents
     // when the file creation event is triggered from a WorkspaceEdit.
     // Given that the VS Code API doesn't provide a way to distinguish
     // the event source, a workaround is to wait 100ms and let WorkspaceEdit
@@ -165,7 +165,7 @@ function getWillRenameHandler(client: LanguageClient) {
                 const edit = await client.sendRequest(WillRenameFiles.type, {
                     files: javaRenameEvents
                 });
-                resolve(client.protocol2CodeConverter.asWorkspaceEdit(edit));
+                resolve(await client.protocol2CodeConverter.asWorkspaceEdit(edit));
             } catch (ex) {
                 reject(ex);
             }
@@ -174,7 +174,25 @@ function getWillRenameHandler(client: LanguageClient) {
 }
 
 function isJavaFile(uri: Uri): boolean {
-    return uri.fsPath && uri.fsPath.endsWith(".java");
+    if (uri.fsPath && uri.fsPath.endsWith(".java")) {
+        return true;
+    }
+    let result = false;
+    const associations = workspace.getConfiguration().get("files.associations");
+    if (associations !== null) {
+        Object.keys(associations).forEach(pattern => {
+            const langId = associations[pattern];
+            if (langId === 'java' && pattern.startsWith('*.') && pattern.length > 2) {
+                const ext = pattern.substring(2);
+                if (!ext.includes('?') && !ext.includes('*')) {
+                    if (uri.fsPath && uri.fsPath.endsWith(`.${ext}`)) {
+                        result = true;
+                    }
+                }
+            }
+        });
+    }
+    return result;
 }
 
 async function isFile(uri: Uri): Promise<boolean> {

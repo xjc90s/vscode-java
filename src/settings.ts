@@ -2,10 +2,13 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { commands, ConfigurationTarget, env, ExtensionContext, Position, Range, SnippetString, TextDocument, Uri, window, workspace, WorkspaceConfiguration, WorkspaceFolder } from 'vscode';
+import { commands, ConfigurationTarget, env, ExtensionContext, Position, Range, Selection, SnippetString, TextDocument, Uri, window, workspace, WorkspaceConfiguration, WorkspaceFolder } from 'vscode';
 import { Commands } from './commands';
 import { cleanupLombokCache } from './lombokSupport';
 import { ensureExists, getJavaConfiguration } from './utils';
+import { apiManager } from './apiManager';
+import { isActive, setActive, smartSemicolonDetection } from './smartSemicolonDetection';
+import { BuildFileSelector, IMPORT_METHOD, PICKED_BUILD_FILES } from './buildFilesSelector';
 
 const DEFAULT_HIDDEN_FILES: string[] = ['**/.classpath', '**/.project', '**/.settings', '**/.factorypath'];
 const IS_WORKSPACE_JDK_ALLOWED = "java.ls.isJdkAllowed";
@@ -131,13 +134,20 @@ function hasJavaConfigChanged(oldConfig: WorkspaceConfiguration, newConfig: Work
 	return hasConfigKeyChanged('jdt.ls.java.home', oldConfig, newConfig)
 		|| hasConfigKeyChanged('home', oldConfig, newConfig)
 		|| hasConfigKeyChanged('jdt.ls.vmargs', oldConfig, newConfig)
-		|| hasConfigKeyChanged('progressReports.enabled', oldConfig, newConfig)
 		|| hasConfigKeyChanged('server.launchMode', oldConfig, newConfig)
-		|| hasConfigKeyChanged('sharedIndexes.location', oldConfig, newConfig);;
+		|| hasConfigKeyChanged('sharedIndexes.location', oldConfig, newConfig)
+		|| hasConfigKeyChanged('transport', oldConfig, newConfig)
+		|| hasConfigKeyChanged('diagnostic.filter', oldConfig, newConfig)
+		|| hasConfigKeyChanged('jdt.ls.javac.enabled', oldConfig, newConfig)
+		|| hasConfigKeyChanged('completion.engine', oldConfig, newConfig);
 }
 
 function hasConfigKeyChanged(key, oldConfig, newConfig) {
-	return oldConfig.get(key) !== newConfig.get(key);
+	const oldValue = oldConfig.get(key);
+	const newValue = newConfig.get(key);
+	return Array.isArray(oldValue) && Array.isArray(newValue)
+		? JSON.stringify(oldValue) !== JSON.stringify(newValue)
+		: oldValue !== newValue;
 }
 
 export function getJavaEncoding(): string {
@@ -274,6 +284,10 @@ export function getJavaServerMode(): ServerMode {
 		|| ServerMode.hybrid;
 }
 
+export function validateAllOpenBuffersOnChanges(): boolean {
+	return workspace.getConfiguration().get('java.edit.validateAllOpenBuffersOnChanges');
+}
+
 export function setGradleWrapperChecksum(wrapper: string, sha256?: string) {
 	const opened = gradleWrapperPromptDialogs.filter(v => (v === sha256));
 	if (opened !== null && opened.length > 0) {
@@ -314,19 +328,33 @@ function unregisterGradleWrapperPromptDialog(sha256: string) {
 	}
 }
 
-export function handleTextBlockClosing(document: TextDocument, changes: readonly import("vscode").TextDocumentContentChangeEvent[]): any {
+let serverReady = false;
+
+export function handleTextDocumentChanges(document: TextDocument, changes: readonly import("vscode").TextDocumentContentChangeEvent[]): any {
+	if (!serverReady) {
+		apiManager.getApiInstance().serverReady().then(() => {
+			serverReady = true;
+		});
+	}
 	const activeTextEditor = window.activeTextEditor;
 	const activeDocument = activeTextEditor && activeTextEditor.document;
 	if (document !== activeDocument || changes.length === 0 || document.languageId !== 'java') {
+		setActive(false);
 		return;
 	}
 	const lastChange = changes[changes.length - 1];
 	if (lastChange.text === null || lastChange.text.length <= 0) {
+		setActive(false);
 		return;
 	}
 	if (lastChange.text !== '"""";') {
+		if (lastChange.text === ';' && serverReady && !isActive()) {
+			smartSemicolonDetection();
+		}
+		setActive(false);
 		return;
 	}
+	setActive(false);
 	const selection = activeTextEditor.selection.active;
 	if (selection !== null) {
 		const start = new Position(selection.line, selection.character - 2);
@@ -344,4 +372,46 @@ export function handleTextBlockClosing(document: TextDocument, changes: readonly
 			activeTextEditor.insertSnippet(new SnippetString(text), position);
 		}
 	}
+}
+
+export async function getImportMode(context: ExtensionContext, selector: BuildFileSelector): Promise<ImportMode> {
+	const mode = getJavaConfiguration().get<string>("import.projectSelection");
+	if (mode === "manual") {
+		// use automatic mode if user has selected "Import All" before.
+		if (context.workspaceState.get(IMPORT_METHOD) === "Import All") {
+			return ImportMode.automatic;
+		}
+
+		// if no selectable build files, use automatic mode
+		const hasBuildFiles = await selector.hasBuildFiles();
+		if (!hasBuildFiles) {
+			return ImportMode.automatic;
+		}
+
+		// If the the manually picked build files has already cached, return manual mode.
+		if (context.workspaceState.get(PICKED_BUILD_FILES) !== undefined) {
+			return ImportMode.manual;
+		}
+
+		const answer: string = await window.showInformationMessage(
+			"Java build files are detected in the workspace. How do you want to import them?",
+			{ modal: true },
+			"Import All", "Let Me Select...");
+		if (answer === "Import All") {
+			context.workspaceState.update(IMPORT_METHOD, "Import All");
+			return ImportMode.automatic;
+		} else if (answer === "Let Me Select...") {
+			return ImportMode.manual;
+		}
+
+		return ImportMode.skip;
+	}
+
+	return ImportMode.automatic;
+}
+
+export enum ImportMode {
+	automatic = 'automatic',
+	manual = 'manual',
+	skip = 'skip',
 }

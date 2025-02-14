@@ -73,7 +73,45 @@ export enum ClientStatus {
 	stopping = "Stopping",
 }
 
-export const extensionApiVersion = '0.7';
+export interface TraceEvent {
+	/**
+	 * Request type.
+	 */
+	type: string;
+	/**
+	 * Time (in milliseconds) taken to process a request.
+	 */
+	duration?: number;
+	/**
+	 * Error that occurs while processing a request.
+	 */
+	error?: any;
+	/**
+	 * The number of results returned by a response.
+	 */
+	resultLength?: number | undefined;
+	/**
+	 * Additional data properties, such as the completion trigger context.
+	 */
+	data?: any;
+	/**
+	 * Whether the response is from the syntax server.
+	 */
+	fromSyntaxServer?: boolean;
+}
+
+export interface SourceInvalidatedEvent {
+	/**
+	 * The paths of the jar files that are linked to new source attachments.
+	 */
+	affectedRootPaths: string[];
+	/**
+	 * The opened editors with updated source.
+	 */
+	affectedEditorDocuments?: Uri[];
+}
+
+export const extensionApiVersion = '0.13';
 
 export interface ExtensionAPI {
 	readonly apiVersion: string;
@@ -98,6 +136,16 @@ export interface ExtensionAPI {
 	 * The Uris in the array point to the project root path.
 	 */
 	readonly onDidProjectsImport: Event<Uri[]>;
+
+	/**
+	 * An event fires on projects deleted. This API is not supported in light weight server mode so far.
+	 * The Uris in the array point to the project root path.
+	 *
+	 * @since API version 0.13
+	 * @since extension version 1.25.0
+	 */
+	readonly onDidProjectsDelete: Event<Uri[]>;
+
 	readonly goToDefinition: GoToDefinitionCommand;
 	/**
 	 * Indicates the current active mode for Java Language Server. Possible modes are:
@@ -118,4 +166,36 @@ export interface ExtensionAPI {
 	 * @since extension version 1.7.0
 	 */
 	readonly serverReady: () => Promise<boolean>;
+
+	/**
+	 * An event that's fired when a request is about to send to language server.
+	 * @since API version 0.12
+	 * @since extension version 1.23.0
+	 */
+	readonly onWillRequestStart: Event<TraceEvent>;
+
+	/**
+	 * An event that's fired when a request has been responded.
+	 * @since API version 0.8
+	 * @since extension version 1.16.0
+	 */
+	readonly onDidRequestEnd: Event<TraceEvent>;
+
+	/**
+	 * Allow 3rd party trace handler to track the language client & server error events.
+	 *
+	 * @since API version 0.9
+	 * @since extension version 1.20.0
+	 */
+	readonly trackEvent: Event<any>;
+
+	/**
+	 * An event that occurs when the package fragment roots have updated source attachments.
+	 * The client should refresh the new source if it has previously requested the source
+	 * from them.
+	 *
+	 * @since API version 0.10
+	 * @since extension version 1.21.0
+	 */
+	readonly onDidSourceInvalidate: Event<SourceInvalidatedEvent>;
 }

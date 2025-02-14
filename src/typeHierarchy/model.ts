@@ -5,6 +5,7 @@ import { getActiveLanguageClient } from "../extension";
 import { LanguageClient } from "vscode-languageclient/node";
 import { getRootItem, resolveTypeHierarchy, typeHierarchyDirectionToContextString } from "./util";
 import { CancellationToken, commands, workspace } from "vscode";
+import { getThemeIcon } from "../themeUtils";
 
 export class TypeHierarchyTreeInput implements SymbolTreeInput<TypeHierarchyItem> {
 	readonly contextValue: string = "javaTypeHierarchy";
@@ -15,19 +16,25 @@ export class TypeHierarchyTreeInput implements SymbolTreeInput<TypeHierarchyItem
 
 	constructor(readonly location: vscode.Location, readonly direction: TypeHierarchyDirection, readonly token: CancellationToken, item: TypeHierarchyItem) {
 		this.baseItem = item;
+		const isMethodHierarchy: boolean =  item.data["method"] !== undefined;
+		let methodName: string;
+		if (isMethodHierarchy) {
+			methodName = item.data["method_name"];
+		}
 		switch (direction) {
 			case TypeHierarchyDirection.both:
-				this.title = "Class Hierarchy";
+				this.title = isMethodHierarchy ? `Method Hierarchy for ${methodName}` : "Class Hierarchy";
 				break;
 			case TypeHierarchyDirection.parents:
-				this.title = "Supertype Hierarchy";
+				this.title = isMethodHierarchy ? `Supertype (Method) Hierarchy for ${methodName}` : "Supertype Hierarchy";
 				break;
 			case TypeHierarchyDirection.children:
-				this.title = "Subtype Hierarchy";
+				this.title = isMethodHierarchy ? `Subtype (Method) Hierarchy for ${methodName}` : "Subtype Hierarchy";
 				break;
 			default:
 				return;
 		}
+
 	}
 
 	async resolve(): Promise<SymbolTreeModel<TypeHierarchyItem>> {
@@ -118,7 +125,7 @@ class TypeHierarchyTreeDataProvider implements vscode.TreeDataProvider<TypeHiera
 		const treeItem: vscode.TreeItem = (element === this.model.getBaseItem()) ? new vscode.TreeItem({ label: element.name, highlights: [[0, element.name.length]] }) : new vscode.TreeItem(element.name);
 		treeItem.contextValue = (element === this.model.getBaseItem() || !element.uri) ? "false" : "true";
 		treeItem.description = element.detail;
-		treeItem.iconPath = TypeHierarchyTreeDataProvider.getThemeIcon(element.kind);
+		treeItem.iconPath = getThemeIcon(element.kind);
 		treeItem.command = (element.uri) ? {
 			command: 'vscode.open',
 			title: 'Open Type Definition Location',
@@ -127,7 +134,7 @@ class TypeHierarchyTreeDataProvider implements vscode.TreeDataProvider<TypeHiera
 			]
 		} : undefined;
 		// workaround: set a specific id to refresh the collapsible state for treeItems, see: https://github.com/microsoft/vscode/issues/114614#issuecomment-763428052
-		treeItem.id = `${element.data}${Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)}`;
+		treeItem.id = `${element.data["element"]}${Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)}`;
 		if (element.expand) {
 			treeItem.collapsibleState = vscode.TreeItemCollapsibleState.Expanded;
 		} else if (this.model.getDirection() === TypeHierarchyDirection.children || this.model.getDirection() === TypeHierarchyDirection.both) {
@@ -241,18 +248,5 @@ class TypeHierarchyTreeDataProvider implements vscode.TreeDataProvider<TypeHiera
 			deprecated: false,
 			expand: false,
 		};
-	}
-
-	private static themeIconIds = [
-		'symbol-file', 'symbol-module', 'symbol-namespace', 'symbol-package', 'symbol-class', 'symbol-method',
-		'symbol-property', 'symbol-field', 'symbol-constructor', 'symbol-enum', 'symbol-interface',
-		'symbol-function', 'symbol-variable', 'symbol-constant', 'symbol-string', 'symbol-number', 'symbol-boolean',
-		'symbol-array', 'symbol-object', 'symbol-key', 'symbol-null', 'symbol-enum-member', 'symbol-struct',
-		'symbol-event', 'symbol-operator', 'symbol-type-parameter'
-	];
-
-	private static getThemeIcon(kind: vscode.SymbolKind): vscode.ThemeIcon | undefined {
-		const id = TypeHierarchyTreeDataProvider.themeIconIds[kind];
-		return id ? new vscode.ThemeIcon(id) : undefined;
 	}
 }

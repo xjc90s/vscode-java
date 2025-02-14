@@ -1,32 +1,42 @@
 
 import * as fs from 'fs';
+import * as fse from 'fs-extra';
 import * as glob from 'glob';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { ExtensionContext, version, workspace } from 'vscode';
-import { Executable, ExecutableOptions, StreamInfo } from 'vscode-languageclient/node';
+import { Executable, ExecutableOptions, StreamInfo, TransportKind, generateRandomPipeName } from 'vscode-languageclient/node';
 import { logger } from './log';
 import { addLombokParam, isLombokSupportEnabled } from './lombokSupport';
 import { RequirementsData } from './requirements';
-import { getJavaagentFlag, getJavaEncoding, getKey, isInWorkspaceFolder, IS_WORKSPACE_VMARGS_ALLOWED } from './settings';
-import { deleteDirectory, ensureExists, getJavaConfiguration, getTimestamp } from './utils';
+import { IS_WORKSPACE_VMARGS_ALLOWED, getJavaEncoding, getJavaagentFlag, getKey, isInWorkspaceFolder } from './settings';
+import { deleteDirectory, ensureExists, getJavaConfiguration, getTimestamp, getVersion } from './utils';
+import { log } from 'console';
 
 // eslint-disable-next-line no-var
 declare var v8debug;
-const DEBUG = (typeof v8debug === 'object') || startedInDebugMode();
+export const DEBUG = (typeof v8debug === 'object') || startedInDebugMode();
 
 /**
  * Argument that tells the program where to generate the heap dump that is created when an OutOfMemoryError is raised and `HEAP_DUMP` has been passed
  */
- export const HEAP_DUMP_LOCATION = '-XX:HeapDumpPath=';
+export const HEAP_DUMP_LOCATION = '-XX:HeapDumpPath=';
 
- /**
-  * Argument that tells the program to generate a heap dump file when an OutOfMemoryError is raised
-  */
- export const HEAP_DUMP = '-XX:+HeapDumpOnOutOfMemoryError';
+/**
+ * Argument that tells the program to generate a heap dump file when an OutOfMemoryError is raised
+ */
+export const HEAP_DUMP = '-XX:+HeapDumpOnOutOfMemoryError';
 
-export function prepareExecutable(requirements: RequirementsData, workspacePath, javaConfig, context: ExtensionContext, isSyntaxServer: boolean): Executable {
+/**
+ * Argument that specifies name of the dependency collector implementation to use.
+ * `df` for depth-first and `bf` for breadth-first.
+ * See: https://github.com/apache/maven-resolver/blob/maven-resolver-1.9.7/src/site/markdown/configuration.md
+ */
+const DEPENDENCY_COLLECTOR_IMPL= '-Daether.dependencyCollector.impl=';
+const DEPENDENCY_COLLECTOR_IMPL_BF= 'bf';
+
+export function prepareExecutable(requirements: RequirementsData, workspacePath, context: ExtensionContext, isSyntaxServer: boolean): Executable {
 	const executable: Executable = Object.create(null);
 	const options: ExecutableOptions = Object.create(null);
 	options.env = Object.assign({ syntaxserver : isSyntaxServer }, process.env);
@@ -39,8 +49,25 @@ export function prepareExecutable(requirements: RequirementsData, workspacePath,
 	}
 	executable.options = options;
 	executable.command = path.resolve(`${requirements.tooling_jre}/bin/java`);
-	executable.args = prepareParams(requirements, javaConfig, workspacePath, context, isSyntaxServer);
-	logger.info(`Starting Java server with: ${executable.command} ${executable.args.join(' ')}`);
+	executable.args = prepareParams(requirements, workspacePath, context, isSyntaxServer);
+	const transportKind = getJavaConfiguration().get('transport');
+
+	switch (transportKind) {
+		case 'stdio':
+			executable.transport = TransportKind.stdio;
+			break;
+		case 'pipe':
+		default:
+			executable.transport = TransportKind.pipe;
+			try {
+				generateRandomPipeName();
+			} catch (error) {
+				logger.warn(`Falling back to 'stdio' (from 'pipe') due to : ${error}`);
+				executable.transport = TransportKind.stdio;
+			}
+			break;
+	}
+	logger.info(`Starting Java server with: ${executable.command} ${executable.args?.join(' ')}`);
 	return executable;
 }
 export function awaitServerConnection(port): Thenable<StreamInfo> {
@@ -60,7 +87,7 @@ export function awaitServerConnection(port): Thenable<StreamInfo> {
 	});
 }
 
-function prepareParams(requirements: RequirementsData, javaConfiguration, workspacePath, context: ExtensionContext, isSyntaxServer: boolean): string[] {
+function prepareParams(requirements: RequirementsData, workspacePath, context: ExtensionContext, isSyntaxServer: boolean): string[] {
 	const params: string[] = [];
 	if (DEBUG) {
 		const port = isSyntaxServer ? 1045 : 1044;
@@ -77,7 +104,56 @@ function prepareParams(requirements: RequirementsData, javaConfiguration, worksp
 				// See https://github.com/redhat-developer/vscode-java/issues/2264
 				// It requires the internal API sun.nio.fs.WindowsFileAttributes.isDirectoryLink() to check if a Windows directory is symlink.
 				'--add-opens',
-				'java.base/sun.nio.fs=ALL-UNNAMED');
+				'java.base/sun.nio.fs=ALL-UNNAMED'
+				);
+
+	const javacEnabled = 'on' === getJavaConfiguration().get('jdt.ls.javac.enabled');
+	if (javacEnabled) {
+		// Javac flags
+		params.push(
+		'--add-opens',
+		'jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.javadoc/jdk.javadoc.internal.doclets.formats.html.taglets.snippet=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.javadoc/jdk.javadoc.internal.doclets.formats.html.taglets=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.compiler/com.sun.tools.javac.platform=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.compiler/com.sun.tools.javac.resources=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.compiler/com.sun.tools.javac.jvm=ALL-UNNAMED',
+		'--add-opens',
+		'jdk.zipfs/jdk.nio.zipfs=ALL-UNNAMED',
+		'--add-opens',
+		'java.compiler/javax.tools=ALL-UNNAMED',
+		'--add-opens',
+		'java.base/java.nio.channels=ALL-UNNAMED',
+		'--add-opens',
+		'java.base/sun.nio.ch=ALL-UNNAMED',
+		'-DICompilationUnitResolver=org.eclipse.jdt.core.dom.JavacCompilationUnitResolver',
+		'-DCompilationUnit.DOM_BASED_OPERATIONS=true',
+		'-DAbstractImageBuilder.compilerFactory=org.eclipse.jdt.internal.javac.JavacCompilerFactory'
+		);
+
+		if('dom' === getJavaConfiguration().get('completion.engine')){
+			params.push('-DCompilationUnit.codeComplete.DOM_BASED_OPERATIONS=true');
+		};
+	}
 
 	params.push('-Declipse.application=org.eclipse.jdt.ls.core.id1',
 				'-Dosgi.bundles.defaultStartLevel=4',
@@ -109,6 +185,9 @@ function prepareParams(requirements: RequirementsData, javaConfiguration, worksp
 	} else {
 		vmargs = '';
 	}
+	if (vmargs.indexOf('-DDetectVMInstallationsJob.disabled=') < 0) {
+		params.push('-DDetectVMInstallationsJob.disabled=true');
+	}
 	const encodingKey = '-Dfile.encoding=';
 	if (vmargs.indexOf(encodingKey) < 0) {
 		params.push(encodingKey + getJavaEncoding());
@@ -130,6 +209,9 @@ function prepareParams(requirements: RequirementsData, javaConfiguration, worksp
 		if (vmargs.indexOf(HEAP_DUMP_LOCATION) < 0) {
 			params.push(`${HEAP_DUMP_LOCATION}${path.dirname(workspacePath)}`);
 		}
+		if (vmargs.indexOf(DEPENDENCY_COLLECTOR_IMPL) < 0) {
+			params.push(`${DEPENDENCY_COLLECTOR_IMPL}${DEPENDENCY_COLLECTOR_IMPL_BF}`);
+		}
 
 		const sharedIndexLocation: string = resolveIndexCache(context);
 		if (sharedIndexLocation) {
@@ -144,7 +226,7 @@ function prepareParams(requirements: RequirementsData, javaConfiguration, worksp
 		params.push('-noverify');
 	}
 
-	const serverHome: string = path.resolve(__dirname, '../server');
+	const serverHome: string = process.env.JDT_LS_PATH || path.resolve(__dirname, '../server');
 	const launchersFound: Array<string> = glob.sync('**/plugins/org.eclipse.equinox.launcher_*.jar', { cwd: serverHome });
 	if (launchersFound.length) {
 		params.push('-jar'); params.push(path.resolve(serverHome, launchersFound[0]));
@@ -160,12 +242,12 @@ function prepareParams(requirements: RequirementsData, javaConfiguration, worksp
 		configDir = isSyntaxServer ? 'config_ss_linux' : 'config_linux';
 	}
 	params.push('-configuration');
+	params.push(startedFromSources() || process.env.JDT_LS_PATH !== undefined ?
+		path.resolve(serverHome, configDir) : resolveConfiguration(context, configDir));
 	if (startedFromSources()) { // Dev Mode: keep the config.ini in the installation location
 		console.log(`Starting jdt.ls ${isSyntaxServer?'(syntax)' : '(standard)'} from vscode-java sources`);
-		params.push(path.resolve(__dirname, '../server', configDir));
-	} else {
-		params.push(resolveConfiguration(context, configDir));
 	}
+
 	params.push('-data'); params.push(workspacePath);
 	return params;
 }
@@ -221,15 +303,7 @@ export function getSharedIndexCache(context: ExtensionContext): string {
 
 function resolveConfiguration(context, configDir) {
 	ensureExists(context.globalStoragePath);
-	const extensionPath = path.resolve(context.extensionPath, "package.json");
-	const packageFile = JSON.parse(fs.readFileSync(extensionPath, 'utf8'));
-	let version;
-	if (packageFile) {
-		version = packageFile.version;
-	}
-	else {
-		version = '0.0.0';
-	}
+	const version = getVersion(context.extensionPath);
 	let configuration = path.resolve(context.globalStoragePath, version);
 	ensureExists(configuration);
 	configuration = path.resolve(configuration, configDir);
@@ -255,7 +329,7 @@ function startedInDebugMode(): boolean {
 	return hasDebugFlag(args);
 }
 
-function startedFromSources(): boolean {
+export function startedFromSources(): boolean {
 	return process.env['DEBUG_VSCODE_JAVA'] === 'true';
 }
 
@@ -282,8 +356,16 @@ export function parseVMargs(params: any[], vmargsLine: string) {
 		arg = arg.replace(/(\\)?"/g, ($0, $1) => { return ($1 ? $0 : ''); });
 		// unescape all escaped double quotes
 		arg = arg.replace(/(\\)"/g, '"');
-		if (params.indexOf(arg) < 0) {
-			params.push(arg);
-		}
+		params.push(arg);
 	});
+}
+
+export function removeEquinoxFragmentOnDarwinX64(context: ExtensionContext) {
+	// https://github.com/redhat-developer/vscode-java/issues/3484
+	const extensionPath = context.extensionPath;
+	const matches = new glob.GlobSync(`${extensionPath}/server/plugins/org.eclipse.equinox.launcher.cocoa.macosx.x86_64*.jar`).found;
+	for (const fragment of matches) {
+		fse.removeSync(fragment);
+		logger.info(`Removing Equinox launcher fragment : ${fragment}`);
+	}
 }
